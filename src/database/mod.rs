@@ -1,7 +1,9 @@
 use std::io::Write;
 
 use md5::Digest;
-
+#[cfg(feature="_rocksdb")]
+pub mod rocksdb;
+#[cfg(feature="_sled")]
 pub mod sled;
 ///固定住数据，不参与淘汰机制
 pub const F_PIN: u8 = 0b0001;
@@ -56,9 +58,10 @@ impl ObjectMeta {
 pub trait Database: Send + Sync {
     async fn get(&self, hashkey: &[u8]) -> Result<Option<ObjectMeta>, String>;
     async fn put(&self, meta: ObjectMeta) -> Result<(), String>;
-    async fn remove(&self, hashkey: &[u8]) -> Result<Option<ObjectMeta>, String>;
+    async fn remove(&self, hashkey: &[u8]) -> Result<(), String>;
     async fn all<'a>(
         &self,
         cb: Box<dyn Send + FnMut(ObjectMeta) -> bool + 'a>,
     ) -> Result<(), String>;
+    async fn gc(&self);
 }

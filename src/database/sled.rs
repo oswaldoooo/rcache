@@ -1,16 +1,27 @@
 use super::ObjectMeta;
-pub struct SledDatabase {
+pub struct SledDatabase<
+    F: std::future::Future<Output = ()> + Send + Sync,
+    T: Send + Sync + Fn(ObjectMeta) -> F,
+> {
     db: std::sync::Arc<sled::Db>,
+    remove_cb: T,
+    min_score:u64,
 }
-impl SledDatabase {
-    pub fn new(db: sled::Db) -> Self {
+impl<F: std::future::Future<Output = ()> + Send + Sync, T: Send + Sync + Fn(ObjectMeta) -> F>
+    SledDatabase<F, T>
+{
+    pub fn new(db: sled::Db, remove_cb: T,min_score:u64) -> Self {
         Self {
             db: std::sync::Arc::new(db),
+            remove_cb,
+            min_score,
         }
     }
 }
 #[async_trait::async_trait]
-impl super::Database for SledDatabase {
+impl<F: std::future::Future<Output = ()> + Send + Sync, T: Send + Sync + Fn(ObjectMeta) -> F>
+    super::Database for SledDatabase<F, T>
+{
     async fn get(&self, hashkey: &[u8]) -> Result<Option<ObjectMeta>, String> {
         let db = self.db.clone();
         let hashkey = hashkey.to_vec();
@@ -34,18 +45,19 @@ impl super::Database for SledDatabase {
             .map_err(|err| format!("sled insert failed {err}"))?;
         Ok(())
     }
-    async fn remove(&self, hashkey: &[u8]) -> Result<Option<ObjectMeta>, String> {
+    async fn remove(&self, hashkey: &[u8]) -> Result<(), String> {
         let db = self.db.clone();
         let hashkey = hashkey.to_vec();
         let ret = tokio::task::spawn_blocking(move || db.remove(hashkey))
             .await
             .map_err(|err| format!("sled remove panic {err}"))?
             .map_err(|err| format!("sled remove error {err}"))?;
-        ret.map_or(Ok(None), |v| -> Result<Option<ObjectMeta>, String> {
-            Ok(Some(
-                bincode::deserialize(&v).map_err(|err| format!("decode error {err}"))?,
-            ))
-        })
+        if let Some(ret) = ret {
+            let data: ObjectMeta =
+                bincode::deserialize(&ret).map_err(|err| format!("decode error {err}"))?;
+            (self.remove_cb)(data).await;
+        }
+        Ok(())
     }
     async fn all<'a>(
         &self,
@@ -85,5 +97,35 @@ impl super::Database for SledDatabase {
             }
         }
         Ok(())
+    }
+    async fn gc(&self){
+        let mut todelete = Vec::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        if let Err(err) = self
+            .all(Box::new(|meta| {
+                if meta.flag & crate::database::F_PIN > 0 {
+                    return true;
+                } else if meta.flag & crate::database::F_L0 > 0
+                    || meta.expire_at <= now
+                    || meta.score <= self.min_score
+                {
+                    todelete.push(meta);
+                    return true;
+                }
+                true
+            }))
+            .await
+        {
+            log::error!("database all failed {err}");
+        } else {
+            for meta in todelete {
+                if let Err(err) = self.remove(&meta.hashkey()).await {
+                    log::error!("remove in drop error {err}");
+                }
+            }
+        }
     }
 }

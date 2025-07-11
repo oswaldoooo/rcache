@@ -1,3 +1,4 @@
+mod binding;
 pub mod cache;
 pub mod database;
 pub mod metrics;

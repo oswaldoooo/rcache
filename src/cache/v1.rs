@@ -164,19 +164,7 @@ impl Cache {
         Ok(())
     }
     pub async fn remove(&self, hashkey: &[u8]) -> Result<(), String> {
-        let ret = self.db.remove(hashkey).await?;
-        if let Some(ret) = ret {
-            tokio::fs::remove_file(ret.file_path.as_str())
-                .await
-                .unwrap_or_else(|err| {
-                    log::error!("remove file {} error {err}", ret.file_path);
-                    ()
-                });
-            if let Some(l) = &*self.remove_cb.read().await {
-                (*l)(ret).await;
-            }
-        }
-        Ok(())
+        self.db.remove(hashkey).await
     }
     ///开始淘汰
     pub async fn start_full_drop(&self) {
@@ -201,35 +189,7 @@ impl Cache {
                 log::error!("write ban switch closed by other routine");
             }
         });
-        let mut todelete = Vec::new();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        if let Err(err) = self
-            .db
-            .all(Box::new(|meta| {
-                if meta.flag & crate::database::F_PIN > 0 {
-                    return true;
-                } else if meta.flag & crate::database::F_L0 > 0
-                    || meta.expire_at <= now
-                    || meta.score <= self.min_score
-                {
-                    todelete.push(meta);
-                    return true;
-                }
-                true
-            }))
-            .await
-        {
-            log::error!("database all failed {err}");
-        } else {
-            for meta in todelete {
-                if let Err(err) = self.remove(&meta.hashkey()).await {
-                    log::error!("remove in drop error {err}");
-                }
-            }
-        }
+        self.db.gc().await;
     }
     async fn update_partition(&self) {
         if let Err(_) = self.write_ban.compare_exchange(
@@ -282,7 +242,6 @@ impl Cache {
                         } else if meta.expire_at <= now {
                             self.db.remove(&meta.hashkey()).await.unwrap_or_else(|err| {
                                 log::error!("remove metadata error {err}");
-                                None
                             });
                         }
                         meta.score = (meta.score >> 1) + diff;
@@ -357,6 +316,7 @@ async fn watch_directory_daemon<
     cb: T,
 ) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
+    tick.tick().await;
     let mut need_notify = true;
     let cb = std::sync::Arc::new(cb);
     loop {
@@ -462,4 +422,37 @@ async fn get_file(
         return Ok(None);
     }
     Ok(Some(buff))
+}
+
+#[cfg(feature = "_rocksdb")]
+pub fn rocksdb_drop_strategy(
+    min_score: Option<u64>,
+    flag: std::sync::Arc<std::sync::atomic::AtomicU8>,
+) -> impl Fn(&[u8], &[u8]) -> Option<Option<Vec<u8>>> {
+    let min_score = min_score.unwrap_or(50);
+    move |_, val| {
+        match bincode::deserialize::<crate::ObjectMeta>(val) {
+            Ok(meta) => {
+                if flag.load(std::sync::atomic::Ordering::Acquire) & super::CACHE_F_GC > 0
+                    && meta.flag & crate::database::F_L0 > 0
+                {
+                    return None;
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("get systime error")
+                    .as_secs();
+
+                if (meta.flag & crate::database::F_PIN == 0)
+                    && (meta.expire_at <= now as i64 || meta.score <= min_score)
+                {
+                    return None;
+                }
+            }
+            Err(err) => {
+                log::error!("decode error {err}");
+            }
+        }
+        Some(None)
+    }
 }
