@@ -11,18 +11,17 @@ macro_rules! insert_and_verify {
         assert!(content == $data, "content not match");
     }};
 }
-async fn remove_file(meta: rcache::ObjectMeta) {
-    tokio::fs::remove_file(meta.file_path.as_str())
-        .await
-        .unwrap_or_else(|err| eprintln!("remove file {} error {err}", meta.file_path));
-}
 ///基础功能测试
 #[tokio::test]
 async fn base() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .init();
+    let sys_file = rcache::cache::v1::SystemFile::build(".test");
     #[cfg(feature = "_sled")]
     let db = {
         let db = sled::open(".test.db")?;
-        rcache::database::sled::SledDatabase::new(db, remove_file, 50)
+        rcache::database::sled::SledDatabase::new(db, rcache::system_file_remove!(sys_file), 50)
     };
 
     let flag = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
@@ -31,10 +30,10 @@ async fn base() -> Result<(), Box<dyn std::error::Error>> {
     let db = {
         rcache::database::rocksdb::RocksdbDb::new(
             rcache::database::rocksdb::RocksDb::open(".test-rocksdb", None, flag.clone()),
-            remove_file,
+            rcache::system_file_remove!(sys_file),
         )
     };
-    let cache = rcache::cache::v1::Cache::new(".test".to_string(), Box::pin(db), None).await;
+    let cache = rcache::cache::v1::Cache::new(db, None, sys_file);
     let data = b"hello world!";
     let meta = rcache::ObjectMeta::build(3, "/hello/world".to_string(), data);
     cache.put(meta.clone(), data.to_vec()).await?;
@@ -68,10 +67,11 @@ async fn test_drop() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
         .init();
+    let sys_file = rcache::cache::v1::SystemFile::build(".test");
     #[cfg(feature = "_sled")]
     let db = {
         let db = sled::open(".test.db")?;
-        rcache::database::sled::SledDatabase::new(db, remove_file, 50)
+        rcache::database::sled::SledDatabase::new(db, rcache::system_file_remove!(sys_file), 50)
     };
 
     let flag = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
@@ -87,19 +87,22 @@ async fn test_drop() -> Result<(), Box<dyn std::error::Error>> {
                 ))),
                 flag,
             ),
-            remove_file,
+            rcache::system_file_remove!(sys_file),
         )
     };
-    let cache = rcache::cache::v1::Cache::new(".test".to_string(), Box::pin(db), None).await;
-    cache
-        .set_remove_cb(Box::new(|meta| {
-            Box::pin(async move {
-                log::info!("remove metadata {}", meta.to_hash_str);
-            })
-        }))
-        .await;
+    let cache = rcache::cache::v1::Cache::new(db, None, sys_file.clone());
     let cache = std::sync::Arc::new(cache);
-    rcache::cache::v1::start_drop_daemon(cache.clone(), 10 << 20).await;
+    sys_file
+        .start_watch(3, 20 << 20, {
+            let cache = cache.clone();
+            move |_size| {
+                let cache = cache.clone();
+                async move {
+                    cache.start_full_drop().await;
+                }
+            }
+        })
+        .await;
     rcache::cache::v1::start_update_score(cache.clone(), 3).await;
     let mut buff = vec![0u8; 10 << 20];
     random(&mut buff).await?;
@@ -126,8 +129,11 @@ async fn test_drop() -> Result<(), Box<dyn std::error::Error>> {
         cache.get(&hashkey).await?.is_some(),
         "expect not nil,got nil"
     );
-    let hashkey=rcache::build_hashkey("/hello/l0");
-    assert!(cache.get(&hashkey).await?.is_none(),"expect nil,got not nil");
+    let hashkey = rcache::build_hashkey("/hello/l0");
+    assert!(
+        cache.get(&hashkey).await?.is_none(),
+        "expect nil,got not nil"
+    );
     Ok(())
 }
 ///嵌入式gc

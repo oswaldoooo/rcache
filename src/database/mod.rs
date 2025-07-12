@@ -1,9 +1,9 @@
 use std::io::Write;
 
 use md5::Digest;
-#[cfg(feature="_rocksdb")]
+#[cfg(feature = "_rocksdb")]
 pub mod rocksdb;
-#[cfg(feature="_sled")]
+#[cfg(feature = "_sled")]
 pub mod sled;
 ///固定住数据，不参与淘汰机制
 pub const F_PIN: u8 = 0b0001;
@@ -25,10 +25,12 @@ pub struct ObjectMeta {
     pub content_size: usize,
     ///访问频率反应
     pub score: u64,
+    pub metadata: std::collections::BTreeMap<String, String>,
     pub flag: u8,
 }
 impl ObjectMeta {
-    pub fn build(ttl: u64, to_hash_str: String, content: &[u8]) -> Self {
+    pub fn build<T:ToString>(ttl: u64, to_hash_str: T, content: &[u8]) -> Self {
+        let to_hash_str=to_hash_str.to_string();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -45,6 +47,7 @@ impl ObjectMeta {
             content_size: content.len(),
             score: 0,
             flag: 0,
+            metadata:Default::default(),
         }
     }
     pub fn hashkey(&self) -> Vec<u8> {

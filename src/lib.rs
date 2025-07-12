@@ -6,6 +6,21 @@ use std::io::Write;
 
 pub use database::ObjectMeta;
 use md5::Digest;
+#[macro_export]
+macro_rules! system_file_remove {
+    ($sys_file:ident) => {{
+        let $sys_file = std::sync::Arc::new($sys_file.clone());
+        move |meta| {
+            let $sys_file = $sys_file.clone();
+            async move {
+                $sys_file
+                    .remove_cb(meta)
+                    .await
+                    .unwrap_or_else(|err| log::error!("remove file error {err}"));
+            }
+        }
+    }};
+}
 struct Defer<E: FnOnce()> {
     cb: Option<E>,
 }

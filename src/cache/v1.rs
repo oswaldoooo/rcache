@@ -6,72 +6,31 @@ const PARTITION_SIZE: usize = 8;
 pub struct Cache {
     ///禁止写入开关
     write_ban: std::sync::atomic::AtomicBool,
-    parent: String,
     db: std::pin::Pin<Box<dyn crate::database::Database>>,
     count_collections:
         [tokio::sync::Mutex<std::collections::BTreeMap<u64, VisitCount>>; PARTITION_SIZE],
     update_collection_index: std::sync::atomic::AtomicUsize,
     ///淘汰分数线
     min_score: u64,
-    remove_cb: tokio::sync::RwLock<
-        Option<
-            Box<
-                dyn Send
-                    + Sync
-                    + Fn(
-                        crate::database::ObjectMeta,
-                    )
-                        -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-            >,
-        >,
-    >,
+    filer: std::pin::Pin<Box<dyn Filer>>,
 }
 
 impl Cache {
-    pub async fn new(
-        parent: String,
-        db: std::pin::Pin<Box<dyn crate::database::Database>>,
+    pub fn new<T: Filer + 'static, D: crate::database::Database + 'static>(
+        db: D,
         min_score: Option<u64>,
+        filer: T,
     ) -> Self {
-        match tokio::fs::metadata(parent.as_str()).await {
-            Ok(meta) => {
-                assert!(meta.is_dir(), "{parent} is not directory");
-            }
-            Err(err) => match err.kind() {
-                std::io::ErrorKind::NotFound => {
-                    tokio::fs::create_dir_all(parent.as_str())
-                        .await
-                        .expect("create dir failed");
-                }
-                _ => {
-                    panic!("get metadata status error {err}");
-                }
-            },
-        }
         Self {
             write_ban: std::sync::atomic::AtomicBool::default(),
-            parent: parent,
-            db: db,
+            db: Box::pin(db),
             count_collections: [const {
                 tokio::sync::Mutex::const_new(std::collections::BTreeMap::new())
             }; PARTITION_SIZE],
             min_score: min_score.unwrap_or(50),
-            remove_cb: tokio::sync::RwLock::const_new(None),
             update_collection_index: Default::default(),
+            filer: Box::pin(filer),
         }
-    }
-    pub async fn set_remove_cb(
-        &self,
-        cb: Box<
-            dyn Send
-                + Sync
-                + Fn(
-                    crate::database::ObjectMeta,
-                )
-                    -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
-        >,
-    ) {
-        (*self.remove_cb.write().await) = Some(cb);
     }
     pub async fn metadata(
         &self,
@@ -140,26 +99,19 @@ impl Cache {
         mut meta: crate::database::ObjectMeta,
         data: Vec<u8>,
     ) -> Result<(), String> {
-        self.alloc_file_path(&mut meta);
-        let file_path = meta.file_path.clone();
+        self.filer.alloc_path(&mut meta);
+        let file_path = std::rc::Rc::new(meta.file_path.clone());
+        let hashkey = meta.hashkey();
         self.db.put(meta).await?;
-        let ret = {
-            let mut fd = tokio::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .create(true)
-                .open(file_path.as_str())
-                .await
-                .map_err(|err| {
-                    crate::metrics::file_error.inc();
-                    format!("open file {file_path} error {err}")
-                })?;
-            fd.write_all(&data).await
-        };
-        if let Err(err) = ret {
-            crate::metrics::file_error.inc();
-            log::error!("open file {file_path} error {err}");
-            let _ = tokio::fs::remove_file(file_path).await;
+        match self.filer.store(&file_path, &data).await {
+            Ok(_) => {}
+            Err(err) => {
+                log::error!("put file {file_path} error {err}");
+                self.db
+                    .remove(&hashkey)
+                    .await
+                    .unwrap_or_else(|err| log::error!("remove hashkey error {err}"));
+            }
         }
         Ok(())
     }
@@ -257,14 +209,6 @@ impl Cache {
             }
         }
     }
-    fn alloc_file_path(&self, meta: &mut crate::database::ObjectMeta) {
-        let hkey = hex::encode(meta.hashkey());
-        meta.file_path = std::path::Path::new(self.parent.as_str())
-            .join(hkey.as_str())
-            .to_str()
-            .unwrap()
-            .to_string();
-    }
 }
 pub async fn start_update_score(src: std::sync::Arc<Cache>, interval: u64) {
     tokio::spawn(async move {
@@ -275,75 +219,12 @@ pub async fn start_update_score(src: std::sync::Arc<Cache>, interval: u64) {
         }
     });
 }
-pub async fn start_drop_daemon(src: std::sync::Arc<Cache>, disk_max_used: u64) {
-    tokio::spawn({
-        let src = src.clone();
-        async move {
-            watch_directory_daemon(
-                src.parent.clone(),
-                disk_max_used,
-                3,
-                Box::new({
-                    let src = src.clone();
-                    move |size: u64| {
-                        let src = src.clone();
-                        Box::pin(async move {
-                            src.start_full_drop().await;
-                            if let Ok(new_size) = stat_disk_use_size(&src.parent).await {
-                                log::info!("complete full drop, disk size {size} -> {new_size}");
-                            }
-                        })
-                    }
-                }),
-            )
-            .await;
-        }
-    });
-}
 struct VisitCount {
     total: std::sync::atomic::AtomicU64,
     latest: u64,
     key: Vec<u8>,
 }
 
-async fn watch_directory_daemon<
-    F: std::future::Future<Output = ()> + Send,
-    T: 'static + Send + Sync + Fn(u64) -> F,
->(
-    parent: String,
-    max_size: u64,
-    interval: u64,
-    cb: T,
-) {
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
-    tick.tick().await;
-    let mut need_notify = true;
-    let cb = std::sync::Arc::new(cb);
-    loop {
-        tick.tick().await;
-        match stat_disk_use_size(&parent).await {
-            Ok(size) => {
-                log::info!(
-                    "check directory size {size} max_size {max_size} need_notify {need_notify}"
-                );
-                crate::metrics::disk_use.set(size as f64);
-                if size >= max_size {
-                    if need_notify {
-                        (*cb)(size).await;
-                        need_notify = false;
-                    }
-                } else {
-                    if !need_notify {
-                        need_notify = true;
-                    }
-                }
-            }
-            Err(err) => {
-                log::error!("stat disk use size failed {err} target={parent}");
-            }
-        }
-    }
-}
 fn stat_disk_use_size<'a>(
     target: &'a str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, String>> + Send + 'a>> {
@@ -454,5 +335,104 @@ pub fn rocksdb_drop_strategy(
             }
         }
         Some(None)
+    }
+}
+pub trait Filer: Send + Sync {
+    fn alloc_path(&self, meta: &mut crate::ObjectMeta);
+    fn store<'a>(
+        &self,
+        file_path: &'a str,
+        content: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + Sync + 'a>>;
+}
+#[derive(Clone)]
+pub struct SystemFile {
+    parent: String,
+}
+impl SystemFile {
+    pub fn build<T: ToString>(parent: T) -> Self {
+        match std::fs::metadata(parent.to_string()) {
+            Ok(info) => {
+                if !info.is_dir() {
+                    panic!("{} is not directory", parent.to_string());
+                }
+            }
+            Err(err) => {
+                if let std::io::ErrorKind::NotFound = err.kind() {
+                    std::fs::create_dir_all(parent.to_string()).expect("init directory failed");
+                } else {
+                    panic!("init {} {err}", parent.to_string());
+                }
+            }
+        }
+        Self {
+            parent: parent.to_string(),
+        }
+    }
+    pub async fn remove_cb(&self, meta: crate::ObjectMeta) -> Result<(), String> {
+        tokio::fs::remove_file(meta.file_path.as_str())
+            .await
+            .map_err(|err| format!("remove file {} error {err}", meta.file_path))?;
+        Ok(())
+    }
+    pub async fn start_watch<F: std::future::Future<Output = ()> + Send >(
+        self,
+        interval: u64,
+        max_size: u64,
+        cb: impl 'static+Send  + Fn(u64) -> F,
+    ) {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                match stat_disk_use_size(&self.parent).await {
+                    Ok(size) =>{
+                        if size>=max_size{
+                            cb(size).await;
+                        }
+                    },
+                    Err(err) => {
+                        log::error!("get disk size error {err} target={}", self.parent);
+                    }
+                }
+            }
+        });
+    }
+}
+impl Filer for SystemFile {
+    fn alloc_path(&self, meta: &mut crate::ObjectMeta) {
+        meta.file_path = std::path::Path::new(self.parent.as_str())
+            .join(hex::encode(meta.hashkey()))
+            .to_str()
+            .unwrap()
+            .to_string();
+    }
+
+    fn store<'a>(
+        &self,
+        file_path: &'a str,
+        content: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + Sync + 'a>>
+    {
+        Box::pin(async move {
+            let mut fd = tokio::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(file_path)
+                .await
+                .map_err(|err| format!("open {file_path} error {err}"))?;
+
+            if let Err(err) = fd.write_all(content).await {
+                log::error!("write to {file_path} error {err}");
+                drop(fd);
+                tokio::fs::remove_file(file_path)
+                    .await
+                    .unwrap_or_else(|err| log::error!("remove {file_path} error {err}"));
+            }
+
+            Ok(())
+        })
     }
 }
